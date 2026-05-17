@@ -1,0 +1,161 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'maven'
+    }
+
+    environment {
+        AWS_ACCOUNT_ID   = "435392106236"
+        AWS_REGION       = "ap-south-1"
+        REPO_NAME        = "devops"
+        ECR_REGISTRY     = "435392106236.dkr.ecr.ap-south-1.amazonaws.com"
+        REGISTRY_URL     = "435392106236.dkr.ecr.ap-south-1.amazonaws.com/devops"
+        IMAGE_TAG        = "${env.BUILD_NUMBER}"
+        EMAIL_RECIPIENTS = "agrawalmm_2@rknec.edu"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Mitali-05/Attendance_Management_System.git'
+                script {
+                    env.GIT_COMMIT_SHORT = bat(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim().readLines().last()
+
+                    env.GIT_AUTHOR = bat(
+                        script: 'git log -1 --pretty=%%an',
+                        returnStdout: true
+                    ).trim().readLines().last()
+
+                    env.GIT_MESSAGE = bat(
+                        script: 'git log -1 --pretty=%%s',
+                        returnStdout: true
+                    ).trim().readLines().last()
+
+                    echo "Commit : ${env.GIT_COMMIT_SHORT}"
+                    echo "Author : ${env.GIT_AUTHOR}"
+                    echo "Message: ${env.GIT_MESSAGE}"
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+
+                bat 'mvn test'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Build JAR') {
+            steps {
+                bat 'mvn clean package -DskipTests'
+                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    bat "docker build -t ${REPO_NAME}:${IMAGE_TAG} ."
+                    echo "Docker image built: ${REPO_NAME}:${IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Login to ECR') {
+            steps {
+                withCredentials([[
+                    $class          : 'AmazonWebServicesCredentialsBinding',
+                    credentialsId   : 'aws-credentials',
+                    accessKeyVariable : 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable : 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+
+                    bat "aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %ECR_REGISTRY%"
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                script {
+                    bat """
+                        docker tag ${REPO_NAME}:${IMAGE_TAG} ${REGISTRY_URL}:${IMAGE_TAG}
+                        docker tag ${REPO_NAME}:${IMAGE_TAG} ${REGISTRY_URL}:latest
+                        docker push ${REGISTRY_URL}:${IMAGE_TAG}
+                        docker push ${REGISTRY_URL}:latest
+                    """
+                    echo "Pushed: ${REGISTRY_URL}:${IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                script {
+                    // Remove local images to free disk space on Jenkins agent
+                    bat """
+                        docker rmi ${REPO_NAME}:${IMAGE_TAG}         || exit 0
+                        docker rmi ${REGISTRY_URL}:${IMAGE_TAG}      || exit 0
+                        docker rmi ${REGISTRY_URL}:latest            || exit 0
+                    """
+                }
+            }
+        }
+    }
+
+    // ── Email notifications ──────────────────────────────────────────────────
+    post {
+        success {
+            mail(
+                to      : "${EMAIL_RECIPIENTS}",
+                subject : "BUILD #${BUILD_NUMBER} SUCCEEDED - Attendance Management",
+                body    : """
+Build Result  : SUCCESS
+
+Project       : Attendance Management System
+Build Number  : ${BUILD_NUMBER}
+Git Commit    : ${env.GIT_COMMIT_SHORT}
+Author        : ${env.GIT_AUTHOR}
+Commit Message: ${env.GIT_MESSAGE}
+
+Docker Image  : ${REGISTRY_URL}:${IMAGE_TAG}
+
+Jenkins URL   : ${BUILD_URL}
+
+Next Step: Trigger the Deploy pipeline with BUILD_NUMBER = ${BUILD_NUMBER}
+                """.stripIndent()
+            )
+        }
+
+        failure {
+            mail(
+                to      : "${EMAIL_RECIPIENTS}",
+                subject : "BUILD #${BUILD_NUMBER} FAILED - Attendance Management",
+                body    : """
+Build Result  : FAILURE
+
+Project       : Attendance Management System
+Build Number  : ${BUILD_NUMBER}
+Git Commit    : ${env.GIT_COMMIT_SHORT ?: 'N/A'}
+Author        : ${env.GIT_AUTHOR      ?: 'N/A'}
+
+Check Logs    : ${BUILD_URL}console
+                """.stripIndent()
+            )
+        }
+
+        always {
+            cleanWs()
+        }
+    }
+}
