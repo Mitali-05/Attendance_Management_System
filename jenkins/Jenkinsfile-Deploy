@@ -1,0 +1,145 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BUILD_TAG', defaultValue: '1', description: 'Jenkins build number from CI pipeline')
+    }
+
+    environment {
+        AWS_ACCOUNT_ID = "435392106236"
+        AWS_REGION     = "ap-south-1"
+        REPO_NAME      = "devops"
+        REGISTRY_URL   = "435392106236.dkr.ecr.ap-south-1.amazonaws.com"
+        EC2_HOST       = "ec2-98-93-178-156.compute-1.amazonaws.com"
+        EC2_USER       = "ec2-user"
+        CONTAINER_NAME = "attendance-app"
+        APP_PORT       = "8080"
+    }
+
+    stages {
+
+        stage('Validate') {
+            steps {
+                script {
+                    if (!params.BUILD_TAG?.trim()) {
+                        error("BUILD_TAG is required!")
+                    }
+                    echo "========================================="
+                    echo "IMAGE : ${REGISTRY_URL}/${REPO_NAME}:${params.BUILD_TAG}"
+                    echo "HOST  : ${EC2_HOST}"
+                    echo "========================================="
+                }
+            }
+        }
+
+        stage('Login to ECR') {
+            steps {
+                withCredentials([aws(credentialsId: 'aws-credentials')]) {
+                    bat """
+                        aws ecr get-login-password --region %AWS_REGION% > token.txt
+                        docker login --username AWS --password-stdin %REGISTRY_URL% < token.txt
+                        del token.txt
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to EC2') {
+            steps {
+                withCredentials([
+                    file(credentialsId: 'ec2-pem-key', variable: 'KEY_FILE'),
+                    aws(credentialsId: 'aws-credentials')
+                ]) {
+                    script {
+                        def tag = params.BUILD_TAG
+
+                        writeFile file: 'deploy.sh', text: """\
+#!/bin/bash
+set -e
+
+export AWS_ACCESS_KEY_ID=${env.AWS_ACCESS_KEY_ID}
+export AWS_SECRET_ACCESS_KEY=${env.AWS_SECRET_ACCESS_KEY}
+export AWS_DEFAULT_REGION=${env.AWS_REGION}
+
+echo "==> Checking Docker..."
+if ! command -v docker &>/dev/null; then
+    sudo dnf update -y && sudo dnf install -y docker
+    sudo systemctl start docker && sudo systemctl enable docker
+fi
+
+echo "==> Logging in to ECR..."
+aws ecr get-login-password --region ${env.AWS_REGION} | \\
+    sudo docker login --username AWS --password-stdin ${env.REGISTRY_URL}
+
+echo "==> Pulling image ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}..."
+sudo docker pull ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
+
+echo "==> Stopping old container..."
+sudo docker rm -f ${env.CONTAINER_NAME} || true
+
+echo "==> Starting new container on port ${env.APP_PORT}..."
+sudo docker run -d \\
+    --name ${env.CONTAINER_NAME} \\
+    --restart unless-stopped \\
+    -p ${env.APP_PORT}:8080 \\
+    ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
+
+echo "==> Container status:"
+sudo docker ps --filter name=${env.CONTAINER_NAME}
+
+echo "Deploy Success"
+"""
+
+                        bat """
+                            icacls "%KEY_FILE%" /inheritance:r
+                            icacls "%KEY_FILE%" /remove "BUILTIN\\Users"
+                            icacls "%KEY_FILE%" /remove "BUILTIN\\Administrators"
+                            icacls "%KEY_FILE%" /remove "NT AUTHORITY\\Authenticated Users"
+                            icacls "%KEY_FILE%" /grant "NT AUTHORITY\\SYSTEM:(F)"
+
+                            scp -o StrictHostKeyChecking=no -i "%KEY_FILE%" deploy.sh %EC2_USER%@%EC2_HOST%:/tmp/deploy.sh
+                            if errorlevel 1 exit /b 1
+
+                            ssh -o StrictHostKeyChecking=no -i "%KEY_FILE%" %EC2_USER%@%EC2_HOST% "bash /tmp/deploy.sh"
+                            if errorlevel 1 exit /b 1
+
+                            del deploy.sh
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                script {
+                    echo "Testing if app is up..."
+                    retry(5) {
+                        sleep(10)
+                        bat "curl --fail --silent --max-time 10 http://%EC2_HOST%:%APP_PORT%/attendance/status"
+                    }
+                    echo "Smoke test PASSED - app is running!"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "========================================="
+            echo "DEPLOY #${BUILD_NUMBER} SUCCEEDED"
+            echo "Image Tag : ${params.BUILD_TAG}"
+            echo "App URL   : http://${EC2_HOST}:${APP_PORT}/attendance/status"
+            echo "========================================="
+        }
+        failure {
+            echo "========================================="
+            echo "DEPLOY #${BUILD_NUMBER} FAILED"
+            echo "Logs : ${BUILD_URL}console"
+            echo "========================================="
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
