@@ -53,54 +53,78 @@ pipeline {
                     script {
                         def tag = params.BUILD_TAG
 
-                        writeFile file: 'deploy.sh', text: """\
-#!/bin/bash
+                        writeFile file: 'deploy.sh', text: """#!/bin/bash
 set -e
 
-export AWS_ACCESS_KEY_ID=${env.AWS_ACCESS_KEY_ID}
-export AWS_SECRET_ACCESS_KEY=${env.AWS_SECRET_ACCESS_KEY}
-export AWS_DEFAULT_REGION=${env.AWS_REGION}
+export AWS_ACCESS_KEY_ID='${env.AWS_ACCESS_KEY_ID}'
+export AWS_SECRET_ACCESS_KEY='${env.AWS_SECRET_ACCESS_KEY}'
+export AWS_DEFAULT_REGION='${env.AWS_REGION}'
 
 echo "==> Checking Docker..."
-if ! command -v docker &>/dev/null; then
-    sudo dnf update -y && sudo dnf install -y docker
-    sudo systemctl start docker && sudo systemctl enable docker
+if ! command -v docker >/dev/null 2>&1; then
+    sudo dnf update -y
+    sudo dnf install -y docker
+    sudo systemctl enable docker
+    sudo systemctl start docker
+fi
+
+echo "==> Checking AWS CLI..."
+if ! command -v aws >/dev/null 2>&1; then
+    sudo dnf install -y awscli
 fi
 
 echo "==> Logging in to ECR..."
-aws ecr get-login-password --region ${env.AWS_REGION} | \\
-    sudo docker login --username AWS --password-stdin ${env.REGISTRY_URL}
+aws ecr get-login-password --region ${env.AWS_REGION} | sudo docker login --username AWS --password-stdin ${env.REGISTRY_URL}
 
-echo "==> Pulling image ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}..."
+echo "==> Pulling image..."
 sudo docker pull ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
 
-echo "==> Stopping old container..."
+echo "==> Removing old container if exists..."
 sudo docker rm -f ${env.CONTAINER_NAME} || true
 
-echo "==> Starting new container on port ${env.APP_PORT}..."
+echo "==> Starting new container..."
 sudo docker run -d \\
-    --name ${env.CONTAINER_NAME} \\
-    --restart unless-stopped \\
-    -p ${env.APP_PORT}:8080 \\
-    ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
+  --name ${env.CONTAINER_NAME} \\
+  --restart unless-stopped \\
+  -p ${env.APP_PORT}:8080 \\
+  ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
 
-echo "==> Container status:"
-sudo docker ps --filter name=${env.CONTAINER_NAME}
+echo "==> Waiting for app startup..."
+sleep 20
 
-echo "Deploy Success"
+echo "==> Container running status:"
+sudo docker ps -a --filter name=${env.CONTAINER_NAME}
+
+echo "==> Last container logs:"
+sudo docker logs ${env.CONTAINER_NAME} --tail 100 || true
+
+echo "==> Local health check inside EC2..."
+for i in 1 2 3 4 5 6 7 8 9 10
+do
+  if curl --fail --silent --max-time 10 http://localhost:${env.APP_PORT}/attendance/status >/dev/null; then
+    echo "Local health check passed"
+    exit 0
+  fi
+  echo "Retry \$i/10: app not ready yet"
+  sleep 10
+done
+
+echo "Local health check failed"
+sudo docker logs ${env.CONTAINER_NAME} --tail 200 || true
+exit 1
 """
 
                         bat """
                             icacls "%KEY_FILE%" /inheritance:r
-                            icacls "%KEY_FILE%" /remove "BUILTIN\\Users"
-                            icacls "%KEY_FILE%" /remove "BUILTIN\\Administrators"
-                            icacls "%KEY_FILE%" /remove "NT AUTHORITY\\Authenticated Users"
-                            icacls "%KEY_FILE%" /grant "NT AUTHORITY\\SYSTEM:(F)"
+                            icacls "%KEY_FILE%" /remove "BUILTIN\\\\Users"
+                            icacls "%KEY_FILE%" /remove "BUILTIN\\\\Administrators"
+                            icacls "%KEY_FILE%" /remove "NT AUTHORITY\\\\Authenticated Users"
+                            icacls "%KEY_FILE%" /grant "NT AUTHORITY\\\\SYSTEM:(F)"
 
                             scp -o StrictHostKeyChecking=no -i "%KEY_FILE%" deploy.sh %EC2_USER%@%EC2_HOST%:/tmp/deploy.sh
                             if errorlevel 1 exit /b 1
 
-                            ssh -o StrictHostKeyChecking=no -i "%KEY_FILE%" %EC2_USER%@%EC2_HOST% "bash /tmp/deploy.sh"
+                            ssh -o StrictHostKeyChecking=no -i "%KEY_FILE%" %EC2_USER%@%EC2_HOST% "chmod +x /tmp/deploy.sh && bash /tmp/deploy.sh"
                             if errorlevel 1 exit /b 1
 
                             del deploy.sh
@@ -113,12 +137,12 @@ echo "Deploy Success"
         stage('Smoke Test') {
             steps {
                 script {
-                    echo "Testing if app is up..."
+                    echo "Testing public URL..."
                     retry(5) {
                         sleep(10)
-                        bat "curl --fail --silent --max-time 10 http://%EC2_HOST%:%APP_PORT%/attendance/status"
+                        bat "curl --fail --silent --max-time 15 http://%EC2_HOST%:%APP_PORT%/attendance/status"
                     }
-                    echo "Smoke test PASSED - app is running!"
+                    echo "Smoke test PASSED - app is publicly reachable!"
                 }
             }
         }
