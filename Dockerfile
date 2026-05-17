@@ -1,28 +1,13 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 1: Build
-#   Uses a full JDK image to compile and package the Spring Boot application.
-#   The result is a fat JAR in the /build directory.
-# ─────────────────────────────────────────────────────────────────────────────
-FROM eclipse-temurin:17-jdk-alpine AS builder
+FROM maven:3.9.6-eclipse-temurin-17 AS builder
 
 WORKDIR /build
 
-# Copy Maven wrapper and POM first (layer-cache friendly)
-COPY mvnw .
-COPY .mvn .mvn
 COPY pom.xml .
+RUN mvn dependency:go-offline -B
 
-# Download dependencies (cached unless pom.xml changes)
-RUN ./mvnw dependency:go-offline -B
-
-# Copy source code and build
 COPY src ./src
-RUN ./mvnw clean package -DskipTests -B
+RUN mvn clean package -DskipTests -B
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 2: Runtime
-#   Uses a slim JRE-only image.  Copies only the built JAR.
-# ─────────────────────────────────────────────────────────────────────────────
 FROM eclipse-temurin:17-jre-alpine AS runtime
 
 # Security: run as non-root user
