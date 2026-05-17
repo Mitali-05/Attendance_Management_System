@@ -6,58 +6,34 @@ pipeline {
     }
 
     environment {
-        AWS_ACCOUNT_ID = "435392106236"
         AWS_REGION     = "ap-south-1"
         REPO_NAME      = "devops"
         REGISTRY_URL   = "435392106236.dkr.ecr.ap-south-1.amazonaws.com"
         EC2_HOST       = "ec2-98-93-178-156.compute-1.amazonaws.com"
-        CONTAINER_NAME = "attendance-app"
+        EC2_USER       = "ec2-user"
         APP_PORT       = "8080"
+        HEALTH_PATH    = "/attendance/status"
+        CONTAINER_NAME = "attendance-app"
     }
 
     stages {
-
         stage('Validate') {
             steps {
                 script {
                     if (!params.BUILD_TAG?.trim()) {
                         error("BUILD_TAG is required!")
                     }
-
-                    echo "========================================="
-                    echo "IMAGE : ${REGISTRY_URL}/${REPO_NAME}:${params.BUILD_TAG}"
-                    echo "HOST  : ${EC2_HOST}"
-                    echo "========================================="
-                }
-            }
-        }
-
-        stage('Login to ECR') {
-            steps {
-                withCredentials([aws(credentialsId: 'aws-credentials')]) {
-                    bat """
-                        aws ecr get-login-password --region %AWS_REGION% > token.txt
-                        docker login --username AWS --password-stdin %REGISTRY_URL% < token.txt
-                        del token.txt
-                    """
                 }
             }
         }
 
         stage('Deploy to EC2') {
             steps {
-
                 withCredentials([
-                    sshUserPrivateKey(
-                        credentialsId: 'ec2-pem-key',
-                        keyFileVariable: 'KEY_FILE',
-                        usernameVariable: 'SSH_USER'
-                    ),
+                    file(credentialsId: 'ec2-pem-key', variable: 'KEY_FILE'),
                     aws(credentialsId: 'aws-credentials')
                 ]) {
-
                     script {
-
                         def tag = params.BUILD_TAG
 
                         writeFile file: 'deploy.sh', text: """#!/bin/bash
@@ -67,76 +43,59 @@ export AWS_ACCESS_KEY_ID='${env.AWS_ACCESS_KEY_ID}'
 export AWS_SECRET_ACCESS_KEY='${env.AWS_SECRET_ACCESS_KEY}'
 export AWS_DEFAULT_REGION='${env.AWS_REGION}'
 
-echo "==> Installing Docker if missing..."
 if ! command -v docker >/dev/null 2>&1; then
-    sudo dnf update -y
-    sudo dnf install -y docker
+    sudo yum install -y docker || sudo dnf install -y docker
     sudo systemctl enable docker
     sudo systemctl start docker
 fi
 
-echo "==> Installing AWS CLI if missing..."
 if ! command -v aws >/dev/null 2>&1; then
-    sudo dnf install -y awscli
+    sudo yum install -y awscli || sudo dnf install -y awscli
 fi
 
-echo "==> Login to ECR..."
 aws ecr get-login-password --region ${env.AWS_REGION} | sudo docker login --username AWS --password-stdin ${env.REGISTRY_URL}
 
-echo "==> Pulling latest image..."
 sudo docker pull ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
-
-echo "==> Removing old container..."
 sudo docker rm -f ${env.CONTAINER_NAME} || true
 
-echo "==> Starting new container..."
 sudo docker run -d \\
   --name ${env.CONTAINER_NAME} \\
   --restart unless-stopped \\
   -p ${env.APP_PORT}:8080 \\
   ${env.REGISTRY_URL}/${env.REPO_NAME}:${tag}
 
-echo "==> Waiting for application startup..."
-sleep 25
-
-echo "==> Running local health check..."
+sleep 20
 
 for i in 1 2 3 4 5 6 7 8 9 10
 do
-    if curl --fail --silent http://localhost:${env.APP_PORT}/attendance/status >/dev/null; then
-        echo "Application started successfully"
-        exit 0
-    fi
-
-    echo "Retry \$i/10 - application not ready"
-    sleep 10
+  if curl --fail --silent --max-time 10 http://localhost:${env.APP_PORT}${env.HEALTH_PATH} >/dev/null; then
+    exit 0
+  fi
+  sleep 10
 done
 
-echo "Health check failed"
-
 sudo docker logs ${env.CONTAINER_NAME} --tail 200 || true
-
 exit 1
 """
 
                         bat """
-                            icacls "%KEY_FILE%" /inheritance:r
-                            icacls "%KEY_FILE%" /grant:r Jenkins:F
+                            copy "%KEY_FILE%" "%WORKSPACE%\\ec2key.pem"
 
-                            scp -o StrictHostKeyChecking=no ^
-                            -i "%KEY_FILE%" ^
-                            deploy.sh ^
-                            %SSH_USER%@%EC2_HOST%:/tmp/deploy.sh
+                            icacls "%WORKSPACE%\\ec2key.pem" /inheritance:r
+                            icacls "%WORKSPACE%\\ec2key.pem" /grant:r "%USERNAME%:(R)"
+                            icacls "%WORKSPACE%\\ec2key.pem" /grant:r "NT AUTHORITY\\SYSTEM:(R)"
+                            icacls "%WORKSPACE%\\ec2key.pem" /remove:g "BUILTIN\\Users"
+                            icacls "%WORKSPACE%\\ec2key.pem" /remove:g "BUILTIN\\Administrators"
+                            icacls "%WORKSPACE%\\ec2key.pem" /remove:g "NT AUTHORITY\\Authenticated Users"
+                            icacls "%WORKSPACE%\\ec2key.pem" /remove:g "Everyone"
 
+                            scp -o StrictHostKeyChecking=no -i "%WORKSPACE%\\ec2key.pem" deploy.sh %EC2_USER%@%EC2_HOST%:/tmp/deploy.sh
                             if errorlevel 1 exit /b 1
 
-                            ssh -o StrictHostKeyChecking=no ^
-                            -i "%KEY_FILE%" ^
-                            %SSH_USER%@%EC2_HOST% ^
-                            "chmod +x /tmp/deploy.sh && bash /tmp/deploy.sh"
-
+                            ssh -o StrictHostKeyChecking=no -i "%WORKSPACE%\\ec2key.pem" %EC2_USER%@%EC2_HOST% "chmod +x /tmp/deploy.sh && bash /tmp/deploy.sh"
                             if errorlevel 1 exit /b 1
 
+                            del "%WORKSPACE%\\ec2key.pem"
                             del deploy.sh
                         """
                     }
@@ -146,43 +105,15 @@ exit 1
 
         stage('Smoke Test') {
             steps {
-                script {
-
-                    echo "Running public smoke test..."
-
-                    retry(5) {
-
-                        sleep(10)
-
-                        bat """
-                        curl --fail --silent --max-time 20 http://%EC2_HOST%:%APP_PORT%/attendance/status
-                        """
-
-                    }
-
-                    echo "Smoke Test PASSED"
+                retry(5) {
+                    sleep 10
+                    bat "curl --fail --silent --max-time 15 http://%EC2_HOST%:%APP_PORT%%HEALTH_PATH%"
                 }
             }
         }
     }
 
     post {
-
-        success {
-            echo "========================================="
-            echo "DEPLOY #${BUILD_NUMBER} SUCCESS"
-            echo "IMAGE TAG : ${params.BUILD_TAG}"
-            echo "APP URL   : http://${EC2_HOST}:${APP_PORT}/attendance/status"
-            echo "========================================="
-        }
-
-        failure {
-            echo "========================================="
-            echo "DEPLOY #${BUILD_NUMBER} FAILED"
-            echo "Logs : ${BUILD_URL}console"
-            echo "========================================="
-        }
-
         always {
             cleanWs()
         }
