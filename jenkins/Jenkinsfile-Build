@@ -6,13 +6,12 @@ pipeline {
     }
 
     environment {
-        AWS_ACCOUNT_ID   = "435392106236"
-        AWS_REGION       = "ap-south-1"
-        REPO_NAME        = "devops"
-        ECR_REGISTRY     = "435392106236.dkr.ecr.ap-south-1.amazonaws.com"
-        REGISTRY_URL     = "435392106236.dkr.ecr.ap-south-1.amazonaws.com/devops"
-        IMAGE_TAG        = "${env.BUILD_NUMBER}"
-        EMAIL_RECIPIENTS = "agrawalmm_2@rknec.edu"
+        AWS_ACCOUNT_ID = "435392106236"
+        AWS_REGION     = "ap-south-1"
+        REPO_NAME      = "devops"
+        ECR_REGISTRY   = "435392106236.dkr.ecr.ap-south-1.amazonaws.com"
+        REGISTRY_URL   = "435392106236.dkr.ecr.ap-south-1.amazonaws.com/devops"
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"
     }
 
     stages {
@@ -25,27 +24,13 @@ pipeline {
                         script: 'git rev-parse --short HEAD',
                         returnStdout: true
                     ).trim().readLines().last()
-
-                    env.GIT_AUTHOR = bat(
-                        script: 'git log -1 --pretty=%%an',
-                        returnStdout: true
-                    ).trim().readLines().last()
-
-                    env.GIT_MESSAGE = bat(
-                        script: 'git log -1 --pretty=%%s',
-                        returnStdout: true
-                    ).trim().readLines().last()
-
-                    echo "Commit : ${env.GIT_COMMIT_SHORT}"
-                    echo "Author : ${env.GIT_AUTHOR}"
-                    echo "Message: ${env.GIT_MESSAGE}"
+                    echo "Commit: ${env.GIT_COMMIT_SHORT}"
                 }
             }
         }
 
         stage('Test') {
             steps {
-
                 bat 'mvn test'
             }
             post {
@@ -65,8 +50,8 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 script {
-                    bat "docker build -t ${REPO_NAME}:${IMAGE_TAG} ."
-                    echo "Docker image built: ${REPO_NAME}:${IMAGE_TAG}"
+                    bat "docker build -t %REPO_NAME%:%IMAGE_TAG% ."
+                    echo "Built: ${REPO_NAME}:${IMAGE_TAG}"
                 }
             }
         }
@@ -74,12 +59,11 @@ pipeline {
         stage('Login to ECR') {
             steps {
                 withCredentials([[
-                    $class          : 'AmazonWebServicesCredentialsBinding',
-                    credentialsId   : 'aws-credentials',
+                    $class            : 'AmazonWebServicesCredentialsBinding',
+                    credentialsId     : 'aws-credentials',
                     accessKeyVariable : 'AWS_ACCESS_KEY_ID',
                     secretKeyVariable : 'AWS_SECRET_ACCESS_KEY'
                 ]]) {
-
                     bat "aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %ECR_REGISTRY%"
                 }
             }
@@ -89,10 +73,10 @@ pipeline {
             steps {
                 script {
                     bat """
-                        docker tag ${REPO_NAME}:${IMAGE_TAG} ${REGISTRY_URL}:${IMAGE_TAG}
-                        docker tag ${REPO_NAME}:${IMAGE_TAG} ${REGISTRY_URL}:latest
-                        docker push ${REGISTRY_URL}:${IMAGE_TAG}
-                        docker push ${REGISTRY_URL}:latest
+                        docker tag %REPO_NAME%:%IMAGE_TAG% %REGISTRY_URL%:%IMAGE_TAG%
+                        docker tag %REPO_NAME%:%IMAGE_TAG% %REGISTRY_URL%:latest
+                        docker push %REGISTRY_URL%:%IMAGE_TAG%
+                        docker push %REGISTRY_URL%:latest
                     """
                     echo "Pushed: ${REGISTRY_URL}:${IMAGE_TAG}"
                 }
@@ -102,58 +86,30 @@ pipeline {
         stage('Cleanup') {
             steps {
                 script {
-                    // Remove local images to free disk space on Jenkins agent
                     bat """
-                        docker rmi ${REPO_NAME}:${IMAGE_TAG}         || exit 0
-                        docker rmi ${REGISTRY_URL}:${IMAGE_TAG}      || exit 0
-                        docker rmi ${REGISTRY_URL}:latest            || exit 0
+                        docker rmi %REPO_NAME%:%IMAGE_TAG%    || exit 0
+                        docker rmi %REGISTRY_URL%:%IMAGE_TAG% || exit 0
+                        docker rmi %REGISTRY_URL%:latest      || exit 0
                     """
                 }
             }
         }
     }
 
-    // ── Email notifications ──────────────────────────────────────────────────
     post {
         success {
-            mail(
-                to      : "${EMAIL_RECIPIENTS}",
-                subject : "BUILD #${BUILD_NUMBER} SUCCEEDED - Attendance Management",
-                body    : """
-Build Result  : SUCCESS
-
-Project       : Attendance Management System
-Build Number  : ${BUILD_NUMBER}
-Git Commit    : ${env.GIT_COMMIT_SHORT}
-Author        : ${env.GIT_AUTHOR}
-Commit Message: ${env.GIT_MESSAGE}
-
-Docker Image  : ${REGISTRY_URL}:${IMAGE_TAG}
-
-Jenkins URL   : ${BUILD_URL}
-
-Next Step: Trigger the Deploy pipeline with BUILD_NUMBER = ${BUILD_NUMBER}
-                """.stripIndent()
-            )
+            echo "========================================="
+            echo "BUILD #${BUILD_NUMBER} SUCCEEDED"
+            echo "Image: ${REGISTRY_URL}:${IMAGE_TAG}"
+            echo "Commit: ${env.GIT_COMMIT_SHORT}"
+            echo "========================================="
         }
-
         failure {
-            mail(
-                to      : "${EMAIL_RECIPIENTS}",
-                subject : "BUILD #${BUILD_NUMBER} FAILED - Attendance Management",
-                body    : """
-Build Result  : FAILURE
-
-Project       : Attendance Management System
-Build Number  : ${BUILD_NUMBER}
-Git Commit    : ${env.GIT_COMMIT_SHORT ?: 'N/A'}
-Author        : ${env.GIT_AUTHOR      ?: 'N/A'}
-
-Check Logs    : ${BUILD_URL}console
-                """.stripIndent()
-            )
+            echo "========================================="
+            echo "BUILD #${BUILD_NUMBER} FAILED"
+            echo "Check console output: ${BUILD_URL}console"
+            echo "========================================="
         }
-
         always {
             cleanWs()
         }
